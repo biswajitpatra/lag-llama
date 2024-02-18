@@ -705,10 +705,10 @@ class LagLlamaModel(nn.Module):
         x = self.transformer.ln_f(
             x
         )  # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
-        # params = self.param_proj(
-        #     x
-        # )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
-        return x
+        params = self.param_proj(
+            x
+        )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
+        return params
 
     def reset_cache(self) -> None:
         """
