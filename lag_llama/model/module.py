@@ -31,8 +31,8 @@ class Block(nn.Module):
         self.rms_2 = RMSNorm(config.n_embd_per_head * config.n_head)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor, use_kv_cache: bool) -> torch.Tensor:
-        x = x + self.attn(self.rms_1(x), use_kv_cache)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.rms_1(x), False)
         y = x + self.mlp(self.rms_2(x))
         return y
 
@@ -74,8 +74,8 @@ class LlamaRotaryEmbedding(torch.nn.Module):
 
     def forward(self, device, dtype, seq_len=None):
         # x: [bs, num_attention_heads, seq_len, head_size]
-        if seq_len > self.max_seq_len_cached:
-            self._set_cos_sin_cache(seq_len=seq_len, device=device, dtype=dtype)
+        # if seq_len > self.max_seq_len_cached:
+        #     self._set_cos_sin_cache(seq_len=seq_len, device=device, dtype=dtype)
 
         return (
             self.cos_cached[:, :, :seq_len, ...].to(dtype=dtype),
@@ -273,17 +273,6 @@ class CausalSelfAttention(nn.Module):
         q = self.q_proj(x)
         k, v = self.kv_proj(x).split(self.n_embd_per_head * self.n_head, dim=2)
 
-        if use_kv_cache:
-            # Optimized for single next prediction
-            if self.kv_cache is not None:
-                # Update cache
-                k = torch.cat([self.kv_cache[0], k], dim=1)[:, 1:]
-                v = torch.cat([self.kv_cache[1], v], dim=1)[:, 1:]
-                self.kv_cache = k, v
-            else:
-                # Build cache
-                self.kv_cache = k, v
-
         k = k.view(B, -1, self.n_head, self.n_embd_per_head).transpose(
             1, 2
         )  # (B, nh, T, hs)
@@ -307,14 +296,14 @@ class CausalSelfAttention(nn.Module):
         # efficient attention using Flash Attention CUDA kernels
         # When using kv cache at inference, is_causal=False since decoder is causal, at each generation step we want
         # to avoid recalculating the same previous token attention
-        if use_kv_cache:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=False
-            )
-        else:
-            y = F.scaled_dot_product_attention(
-                q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True
-            )
+        # if use_kv_cache:
+        #     y = F.scaled_dot_product_attention(
+        #         q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=False
+        #     )
+        # else:
+        y = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True
+        )
 
         # re-assemble all head outputs side by side
         y = y.transpose(1, 2).contiguous().view(B, T, C)
@@ -378,7 +367,7 @@ class RMSNorm(nn.Module):
         return (self.scale * x_normed).type_as(x)
 
 
-class LagLlamaModel(nn.Module):
+class LagLlamaImpureModel(nn.Module):
     def __init__(
         self,
         context_length: int,
@@ -549,6 +538,177 @@ class LagLlamaModel(nn.Module):
             x
         )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
         return params, loc, scale
+
+    def reset_cache(self) -> None:
+        """
+        Resets all cached key-values in attention.
+        Has to be called after prediction loop in predictor
+        """
+        for block in self.transformer.h:
+            block.y_cache = None
+            block.attn.kv_cache = None
+
+class LagLlamaModel(nn.Module):
+    def __init__(
+        self,
+        context_length: int,
+        max_context_length: int,
+        scaling: str,
+        input_size: int,
+        n_layer: int,
+        n_embd_per_head: int,
+        n_head: int,
+        lags_seq: List[int],
+        distr_output: DistributionOutput,
+        rope_scaling=None,
+        num_parallel_samples: int = 100,
+        time_feat: bool = True,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.context_length = context_length
+        self.lags_seq = lags_seq
+        if time_feat:
+            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size + 6
+        else:
+            feature_size = input_size * (len(self.lags_seq)) + 2 * input_size
+
+        config = LTSMConfig(
+            n_layer=n_layer,
+            n_embd_per_head=n_embd_per_head,
+            n_head=n_head,
+            block_size=max_context_length,
+            feature_size=feature_size,
+            rope_scaling=rope_scaling,
+            dropout=dropout,
+        )
+        self.num_parallel_samples = num_parallel_samples
+
+        if scaling == "mean":
+            self.scaler = MeanScaler(keepdim=True, dim=1)
+        elif scaling == "std":
+            self.scaler = StdScaler(keepdim=True, dim=1)
+        elif scaling == "robust":
+            self.scaler = RobustScaler(keepdim=True, dim=1)
+        else:
+            self.scaler = NOPScaler(keepdim=True, dim=1)
+
+        self.distr_output = distr_output
+        self.param_proj = self.distr_output.get_args_proj(
+            config.n_embd_per_head * config.n_head
+        )
+
+        self.transformer = nn.ModuleDict(
+            dict(
+                wte=nn.Linear(
+                    config.feature_size, config.n_embd_per_head * config.n_head
+                ),
+                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                ln_f=RMSNorm(config.n_embd_per_head * config.n_head),
+            )
+        )
+        self.y_cache = False  # used at time of inference when kv cached is used
+
+    def _init_weights(self, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer)
+            )
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(
+                module.weight, mean=0.0, std=0.02 / math.sqrt(2 * self.config.n_layer)
+            )
+
+    def prepare_input(
+        self,
+        past_target: torch.Tensor,
+        past_observed_values: torch.Tensor,
+        past_time_feat: Optional[torch.Tensor] = None,
+        future_time_feat: Optional[torch.Tensor] = None,
+        future_target: Optional[torch.Tensor] = None,
+    ):
+        scaled_past_target, loc, scale = self.scaler(
+            past_target, past_observed_values
+        )  # Data is standardized (past_observed_values is passed as "weights" parameter) # (bsz, context_length+max(self.lags_seq)
+
+        # In the below code, instead of max(self.lags_seq), it was previously -self.context_length
+        if future_target is not None:
+            input = torch.cat(
+                (
+                    scaled_past_target[..., max(self.lags_seq) :],  # Just the context
+                    (future_target[..., :-1] - loc)
+                    / scale,  # Not sure about the -1 here. Maybe so since the last value isn't used in the model for prediction of any new values. also if the prediction length is 1, this doesn't really affect anything
+                ),
+                dim=-1,
+            )  # Shape is (bsz, context_length+(pred_len-1))
+        else:
+            input = scaled_past_target[..., max(self.lags_seq) :]
+        if (past_time_feat is not None) and (future_time_feat is not None):
+            time_feat = (
+                torch.cat(
+                    (
+                        past_time_feat[..., max(self.lags_seq) :, :],
+                        future_time_feat[..., :-1, :],
+                    ),
+                    dim=1,
+                )
+                if future_time_feat is not None
+                else past_time_feat[..., max(self.lags_seq) :, :]
+            )
+
+        prior_input = (
+            past_target[..., : max(self.lags_seq)] - loc
+        ) / scale  # This the history used to construct lags.  # bsz, max(self.lags_seq)
+
+        lags = lagged_sequence_values(
+            self.lags_seq, prior_input, input, dim=-1
+        )  # Lags are added as an extra dim. Shape is (bsz, context_length+(pred_len-1), len(self.lags_seq))
+
+        static_feat = torch.cat(
+            (loc.abs().log1p(), scale.log()), dim=-1
+        )  # (bsz, 2) (loc and scale are concatenated)
+        expanded_static_feat = unsqueeze_expand(
+            static_feat, dim=-2, size=lags.shape[-2]
+        )  # (bsz, context_length+(pred_len-1), 2)
+        # expanded_static_feat: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
+
+        if past_time_feat is not None:
+            return (
+                torch.cat((lags, expanded_static_feat, time_feat), dim=-1),
+                loc,
+                scale,
+            )
+        else:
+            return torch.cat((lags, expanded_static_feat), dim=-1), loc, scale
+
+    def forward(
+        self,
+        transformer_input
+    ) -> torch.Tensor:
+        # if past_time_feat is not None:
+        # transformer_input, loc, scale = self.prepare_input(
+        #     past_target=past_target,
+        #     past_observed_values=past_observed_values,
+        #     future_target=future_target,
+        #     past_time_feat=past_time_feat,
+        #     future_time_feat=future_time_feat,
+        # )  # return: (bsz, context_length+(pred_len-1), len(self.lags_seq) + 2); (bsz, 1); (bsz, 1)
+        # To use kv cache for inference and pass recent token to transformer
+
+        # forward the LLaMA model itself
+        x = self.transformer.wte(
+            transformer_input
+        )  # token embeddings of shape (b, t, n_embd_per_head*n_head) # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
+
+        for block in self.transformer.h:
+            x = block(x, False)
+        x = self.transformer.ln_f(
+            x
+        )  # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
+        # params = self.param_proj(
+        #     x
+        # )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
+        return x
 
     def reset_cache(self) -> None:
         """
