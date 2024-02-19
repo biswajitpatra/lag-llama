@@ -31,7 +31,7 @@ class Block(nn.Module):
         self.rms_2 = RMSNorm(config.n_embd_per_head * config.n_head)
         self.mlp = MLP(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, feat: bool) -> torch.Tensor:
         x = x + self.attn(self.rms_1(x), False)
         y = x + self.mlp(self.rms_2(x))
         return y
@@ -705,9 +705,16 @@ class LagLlamaModel(nn.Module):
         x = self.transformer.ln_f(
             x
         )  # (bsz, context_length+(pred_len-1), n_embd_per_head*n_head)
-        params = self.param_proj(
-            x
-        )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
+        # params = self.param_proj(
+        #     x
+        # )  # (bsz, context_length+(pred_len-1)) ; (bsz, context_length+(pred_len-1))
+        output = [proj(x) for proj in self.param_proj.proj]
+        df_proj = output[0]
+        loc_proj = output[1]
+        scale_proj = output[2]
+        scale_proj = F.softplus(scale_proj)
+        df_proj = 2.0 + F.softplus(df_proj)
+        params = (df_proj.squeeze(-1), loc_proj.squeeze(-1), scale_proj.squeeze(-1))
         return params
 
     def reset_cache(self) -> None:
